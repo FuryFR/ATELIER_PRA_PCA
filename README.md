@@ -413,3 +413,48 @@ Cette architecture présente plusieurs **limitations critiques** qui la rendent 
 | Atelier (K3d + CronJob 1min) | ~1 minute | ~5-15 min (manuel) |
 | Production (PostgreSQL + Velero) | ~0 (réplication sync) | ~2-5 min (automatisé) |
 | Production multi-région | ~0 (réplication sync) | <1 min (bascule automatique) |
+
+
+
+# ATELIER 2 - Choix point restauration
+
+## Runbook restauration ciblée (4/4 pts)
+
+1. **Lister backups**
+```bash
+kubectl run debug-backup --rm -it --image=busybox --overrides='{"spec":{"containers":[{"name":"debug","image":"busybox","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"backup","mountPath":"/backup"}]}],"volumes":[{"name":"backup","persistentVolumeClaim":{"claimName":"pra-backup"}}]}}' -n pra
+# ls -lht /backup/ | head -10
+exit
+```
+
+2. **Isoler app**
+```bash
+kubectl scale deployment flask --replicas=0 -n pra
+kubectl patch cronjob sqlite-backup -p '{"spec":{"suspend":true}}' -n pra
+kubectl delete job --all -n pra
+```
+
+3. **Job restauration (pra/50-job-restore.yaml)**
+```bash
+env:
+- name: BACKUP_FILE
+  value: "app-1740601234.db"  # CHOISIR ICI
+```
+
+4. **Exécuter**
+```bash
+kubectl apply -f pra/50-job-restore.yaml -n pra
+kubectl wait --for=condition=complete job/restore-from-specific-backup -n pra --timeout=60s
+```
+
+5. **Remise service**
+```bash
+kubectl scale deployment flask --replicas=1 -n pra
+kubectl patch cronjob sqlite-backup -p '{"spec":{"suspend":false}}' -n pra
+kubectl port-forward svc/flask 8080:80 >/tmp/web.log 2>&1 -n pra &
+```
+
+6. **Validation**
+curl localhost:8080/consultation  # Données restaurées ✓
+curl localhost:8080/count         # Count correct ✓
+```
