@@ -281,3 +281,135 @@ Cet atelier PRA PCA, **noté sur 20 points**, est évalué sur la base du barèm
 - Qualité du Readme (lisibilité, erreur, ...) (3 points)
 - Processus travail (quantité de commits, cohérence globale, interventions externes, ...) (4 points) 
 
+
+
+## Séquence 5 : Exercices
+
+### Exercice 1 : Quels sont les composants dont la perte entraîne une perte de données ?
+
+La perte de données survient uniquement si les **deux volumes persistants sont perdus simultanément** :
+
+| Composant | Impact si perdu seul | Impact si perdu avec l'autre |
+|---|---|---|
+| **Pod Flask** | ❌ Aucune perte (stateless) | ❌ Aucune perte |
+| **PVC pra-data** | ⚠️ Perte des données non encore sauvegardées (< 1 min) | 💥 Perte totale |
+| **PVC pra-backup** | ⚠️ Perte de l'historique des backups | 💥 Perte totale |
+
+Le Pod Flask est **stateless** : il ne stocke aucune donnée en lui-même.
+Toute la donnée applicative réside dans le **PVC pra-data** (BDD en production).
+Le **PVC pra-backup** contient les sauvegardes permettant la restauration.
+
+> ⚠️ Point critique : les deux PVC résident sur le **même disque physique du node K3d**.
+> Si ce disque est perdu, les deux PVC sont détruits simultanément → perte totale des données.
+
+---
+
+### Exercice 2 : Pourquoi nous n'avons pas perdu les données lors de la suppression du pod (Scénario 1 - PCA) ?
+
+Dans Kubernetes, le **stockage est découplé du cycle de vie du pod**.
+
+Un PVC (PersistentVolumeClaim) est un objet Kubernetes **indépendant** du pod.
+Lorsque le pod Flask est supprimé :
+1. Kubernetes détecte via le **Deployment** que le nombre de replicas souhaité (1) n'est plus atteint
+2. Il recrée automatiquement un **nouveau pod** sous un nouvel identifiant
+3. Ce nouveau pod monte le **même PVC pra-data**, qui n'a jamais été touché
+4. La base SQLite est retrouvée intacte, aucune donnée n'est perdue
+
+C'est la définition du **PCA (Plan de Continuité d'Activité)** :
+> La disponibilité est assurée **automatiquement et sans intervention humaine**.
+> Il n'y a aucune rupture de service et aucune perte de données.
+
+---
+
+### Exercice 3 : Quels sont les RTO et RPO de cette solution ?
+
+#### RPO — Recovery Point Objective (Perte de données maximale acceptable)
+
+> **RPO ≈ 1 minute**
+
+Le CronJob de sauvegarde s'exécute **toutes les minutes**.
+Dans le pire des cas, si un sinistre survient juste après un backup,
+on perd au maximum **60 secondes** de données (les écritures non encore sauvegardées).
+
+#### RTO — Recovery Time Objective (Durée de restauration maximale acceptable)
+
+> **RTO ≈ 5 à 15 minutes** (manuel)
+
+Le RTO se décompose ainsi :
+
+| Étape | Durée estimée |
+|---|---|
+| Détection du sinistre | ~1-2 min |
+| Suppression du pod et PVC corrompu | ~1 min |
+| Recréation de l'infra (`kubectl apply`) | ~1-2 min |
+| Lancement du job de restauration | ~1-2 min |
+| Vérification et remise en service | ~1-2 min |
+| **Total** | **~5 à 15 min** |
+
+> ⚠️ Ce RTO est **manuel** et donc variable selon la disponibilité de l'opérateur.
+> Il n'existe aucune automatisation de la procédure de reprise dans cet atelier.
+
+---
+
+### Exercice 4 : Pourquoi cette solution ne peut pas être utilisée en production ?
+
+Cette architecture présente plusieurs **limitations critiques** qui la rendent inadaptée à un vrai environnement de production :
+
+#### 🔴 Problèmes de résilience
+- **Single Point of Failure** : les deux PVC sont sur le **même disque du node K3d**.
+  Un crash du node entraîne la perte simultanée des données ET des backups.
+- **Pas de réplication** : aucune copie des données dans un second datacenter ou zone de disponibilité.
+  Un sinistre physique (incendie, inondation, panne matérielle) détruit tout.
+- **Cluster K3d mono-node effectif** : K3d tourne dans un Codespace éphémère,
+  si le Codespace est détruit, le cluster entier disparaît.
+
+#### 🔴 Problèmes de sécurité
+- **Backups non chiffrés** : les fichiers `.db` sont copiés en clair dans `/backup`.
+- **Pas de contrôle d'accès** sur les volumes (RBAC insuffisant).
+- **SQLite** n'est pas conçu pour un usage en production multi-utilisateurs
+  (pas de connexions concurrentes, pas de haute disponibilité native).
+
+#### 🔴 Problèmes opérationnels
+- **Restauration 100% manuelle** : aucun runbook automatisé, dépendance à l'humain.
+- **Pas de monitoring** : aucune alerte si le CronJob échoue ou si un backup est corrompu.
+- **Pas de rétention** : les backups s'accumulent indéfiniment, sans rotation ni purge.
+- **RPO de 1 minute** peut être insuffisant pour des données critiques (transactions bancaires, etc.).
+
+---
+
+### Exercice 5 : Proposition d'une architecture plus robuste
+
+#### Améliorations proposées
+
+**1. Base de données production-ready**
+- Remplacer SQLite par **PostgreSQL** géré par un opérateur Kubernetes
+  (ex : [CloudNativePG](https://cloudnative-pg.io/)) avec réplication synchrone master/replica.
+
+**2. Stockage répliqué**
+- Utiliser un **StorageClass avec réplication** entre nodes et zones :
+  [Longhorn](https://longhorn.io/), [Rook/Ceph](https://rook.io/), ou le CSI natif du cloud provider.
+- Activer les **VolumeSnapshots** CSI pour des snapshots instantanés et cohérents.
+
+**3. Sauvegardes externes chiffrées**
+- Déployer **[Velero](https://velero.io/)** pour sauvegarder namespaces + PVC
+  vers un stockage objet externe (S3, Azure Blob, GCS) avec chiffrement AES-256.
+- Politique de rétention : 7 jours de backups quotidiens, 4 semaines de backups hebdomadaires.
+
+**4. Haute disponibilité du cluster**
+- Cluster Kubernetes **multi-nœuds** avec 3 masters (etcd en HA)
+- Déploiement **multi-zone** voire **multi-région** pour le DR géographique.
+- `PodDisruptionBudgets` + `Liveness/Readiness probes` sur tous les pods critiques.
+
+**5. Observabilité et automatisation**
+- **Prometheus + Alertmanager** : alertes sur échec de CronJob, saturation du stockage.
+- **Grafana** : tableaux de bord RTO/RPO en temps réel.
+- **Runbook automatisé** de restauration via ArgoCD ou un opérateur custom.
+- **Game Days** réguliers pour valider les RTO/RPO réels en conditions de production.
+
+#### Comparaison RTO/RPO
+
+| Architecture | RPO | RTO |
+|---|---|---|
+| Atelier (K3d + CronJob 1min) | ~1 minute | ~5-15 min (manuel) |
+| Production (PostgreSQL + Velero) | ~0 (réplication sync) | ~2-5 min (automatisé) |
+| Production multi-région | ~0 (réplication sync) | <1 min (bascule automatique) |
